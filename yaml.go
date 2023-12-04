@@ -303,19 +303,13 @@ func convertToJSONableObject(yamlObj interface{}, jsonTarget *reflect.Value) (in
 			if jsonTarget != nil {
 				t := *jsonTarget
 				if t.Kind() == reflect.Struct {
-					keyBytes := []byte(keyString)
 					// Find the field that the JSON library would use.
 					var f *field
 					fields := cachedTypeFields(t.Type())
 					for i := range fields {
-						ff := &fields[i]
-						if bytes.Equal(ff.nameBytes, keyBytes) {
-							f = ff
+						f = &fields[i]
+						if f.name == keyString {
 							break
-						}
-						// Do case-insensitive comparison.
-						if f == nil && ff.equalFold(ff.nameBytes, keyBytes) {
-							f = ff
 						}
 					}
 					if f != nil {
