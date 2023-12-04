@@ -16,21 +16,21 @@ import (
 
 // indirect walks down 'value' allocating pointers as needed,
 // until it gets to a non-pointer.
-// if it encounters an Unmarshaler, indirect stops and returns that.
-// if decodingNull is true, indirect stops at the last pointer so it can be set to nil.
-func indirect(value reflect.Value, decodingNull bool) (json.Unmarshaler, encoding.TextUnmarshaler, reflect.Value) {
+// If it encounters an Unmarshaler, indirect stops and returns nil.
+func indirect(value reflect.Value) *reflect.Value {
 	// If 'value' is a named type and is addressable,
 	// start with its address, so that if the type has pointer methods,
 	// we find them.
 	if value.Kind() != reflect.Ptr && value.Type().Name() != "" && value.CanAddr() {
 		value = value.Addr()
 	}
+
 	for {
 		// Load value from interface, but only if the result will be
 		// usefully addressable.
 		if value.Kind() == reflect.Interface && !value.IsNil() {
 			element := value.Elem()
-			if element.Kind() == reflect.Ptr && !element.IsNil() && (!decodingNull || element.Elem().Kind() == reflect.Ptr) {
+			if element.Kind() == reflect.Ptr && !element.IsNil() {
 				value = element
 				continue
 			}
@@ -40,27 +40,33 @@ func indirect(value reflect.Value, decodingNull bool) (json.Unmarshaler, encodin
 			break
 		}
 
-		if value.Elem().Kind() != reflect.Ptr && decodingNull && value.CanSet() {
+		// Prevent infinite loop if v is an interface pointing to its own address:
+		//     var v interface{}
+		//     v = &v
+		if value.Elem().Kind() == reflect.Interface && value.Elem().Elem() == value {
+			value = value.Elem()
 			break
 		}
+
 		if value.IsNil() {
-			if value.CanSet() {
-				value.Set(reflect.New(value.Type().Elem()))
-			} else {
-				value = reflect.New(value.Type().Elem())
+			value = reflect.New(value.Type().Elem())
+		}
+
+		// We have a JSON or Text Umarshaler at this level, so we can't be trying
+		// to decode into a string.
+		if value.Type().NumMethod() > 0 && value.CanInterface() {
+			if _, ok := value.Interface().(json.Unmarshaler); ok {
+				return nil
+			}
+			if _, ok := value.Interface().(encoding.TextUnmarshaler); ok {
+				return nil
 			}
 		}
-		if value.Type().NumMethod() > 0 {
-			if u, ok := value.Interface().(json.Unmarshaler); ok {
-				return u, nil, reflect.Value{}
-			}
-			if u, ok := value.Interface().(encoding.TextUnmarshaler); ok {
-				return nil, u, reflect.Value{}
-			}
-		}
+
 		value = value.Elem()
 	}
-	return nil, nil, value
+
+	return &value
 }
 
 // A field represents a single field found in a struct.
@@ -124,8 +130,7 @@ func typeFields(t reflect.Type) []field {
 	next := []field{{typ: t}}
 
 	// Count of queued names for current level and the next.
-	var count map[reflect.Type]int
-	var nextCount map[reflect.Type]int
+	var count, nextCount map[reflect.Type]int
 
 	// Types already visited at an earlier level.
 	visited := map[reflect.Type]bool{}
@@ -146,7 +151,19 @@ func typeFields(t reflect.Type) []field {
 			// Scan f.typ for fields to include.
 			for i := 0; i < f.typ.NumField(); i++ {
 				sf := f.typ.Field(i)
-				if sf.PkgPath != "" { // unexported
+				if sf.Anonymous {
+					t := sf.Type
+					if t.Kind() == reflect.Ptr {
+						t = t.Elem()
+					}
+					if !sf.IsExported() && t.Kind() != reflect.Struct {
+						// Ignore embedded fields of unexported non-struct types.
+						continue
+					}
+					// Do not ignore embedded fields of unexported struct types
+					// since they may have exported fields.
+				} else if !sf.IsExported() {
+					// Ignore unexported non-embedded fields.
 					continue
 				}
 				tag := sf.Tag.Get("json")
@@ -167,6 +184,19 @@ func typeFields(t reflect.Type) []field {
 					ft = ft.Elem()
 				}
 
+				// Only strings, floats, integers, and booleans can be quoted.
+				quoted := false
+				if opts.Contains("string") {
+					switch ft.Kind() {
+					case reflect.Bool,
+						reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+						reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+						reflect.Float32, reflect.Float64,
+						reflect.String:
+						quoted = true
+					}
+				}
+
 				// Record found field and index sequence.
 				if name != "" || !sf.Anonymous || ft.Kind() != reflect.Struct {
 					tagged := name != ""
@@ -179,7 +209,7 @@ func typeFields(t reflect.Type) []field {
 						index:     index,
 						typ:       ft,
 						omitEmpty: opts.Contains("omitempty"),
-						quoted:    opts.Contains("string"),
+						quoted:    quoted,
 					})
 
 					if count[f.typ] > 1 {
@@ -244,65 +274,24 @@ func typeFields(t reflect.Type) []field {
 // will be false: This condition is an error in Go and we skip all
 // the fields.
 func dominantField(fields []field) (field, bool) {
-	// The fields are sorted in increasing index-length order. The winner
-	// must therefore be one with the shortest index length. Drop all
-	// longer entries, which is easy: just truncate the slice.
-	length := len(fields[0].index)
-	tagged := -1 // Index of first tagged field.
-	for i, f := range fields {
-		if len(f.index) > length {
-			fields = fields[:i]
-			break
-		}
-		if f.tag {
-			if tagged >= 0 {
-				// Multiple tagged fields at the same level: conflict.
-				// Return no field.
-				return field{}, false
-			}
-			tagged = i
-		}
-	}
-	if tagged >= 0 {
-		return fields[tagged], true
-	}
-	// All remaining fields have the same length. If there's more than one,
-	// we have a conflict (two fields named "X" at the same level) and we
-	// return no field.
-	if len(fields) > 1 {
+	// The fields are sorted in increasing index-length order, then by presence of tag.
+	// That means that the first field is the dominant one. We need only check
+	// for error cases: two fields at top level, either both tagged or neither tagged.
+	if len(fields) > 1 && len(fields[0].index) == len(fields[1].index) && fields[0].tag == fields[1].tag {
 		return field{}, false
 	}
 	return fields[0], true
 }
 
-var fieldCache struct {
-	sync.RWMutex
-	m map[reflect.Type][]field
-}
+var fieldCache sync.Map // map[reflect.Type]structFields
 
 // cachedTypeFields is like typeFields but uses a cache to avoid repeated work.
 func cachedTypeFields(t reflect.Type) []field {
-	fieldCache.RLock()
-	f := fieldCache.m[t]
-	fieldCache.RUnlock()
-	if f != nil {
-		return f
+	if f, ok := fieldCache.Load(t); ok {
+		return f.([]field)
 	}
-
-	// Compute fields without lock.
-	// Might duplicate effort but won't hold other computations back.
-	f = typeFields(t)
-	if f == nil {
-		f = []field{}
-	}
-
-	fieldCache.Lock()
-	if fieldCache.m == nil {
-		fieldCache.m = map[reflect.Type][]field{}
-	}
-	fieldCache.m[t] = f
-	fieldCache.Unlock()
-	return f
+	f, _ := fieldCache.LoadOrStore(t, typeFields(t))
+	return f.([]field)
 }
 
 func isValidTag(s string) bool {
@@ -311,14 +300,12 @@ func isValidTag(s string) bool {
 	}
 	for _, c := range s {
 		switch {
-		case strings.ContainsRune("!#$%&()*+-./:<=>?@[]^_{|}~ ", c):
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
 			// Backslash and quote chars are reserved, but
 			// otherwise any punctuation chars are allowed
 			// in a tag name.
-		default:
-			if !unicode.IsLetter(c) && !unicode.IsDigit(c) {
-				return false
-			}
+		case !unicode.IsLetter(c) && !unicode.IsDigit(c):
+			return false
 		}
 	}
 	return true
