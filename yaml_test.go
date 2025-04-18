@@ -427,7 +427,7 @@ func TestUnmarshal(t *testing.T) {
 		"decode 2^53 + 1 into interface": {
 			encoded:    []byte("9007199254740993"),
 			decodeInto: new(interface{}),
-			decoded:    9.007199254740992e+15,
+			decoded:    int64(9007199254740993),
 		},
 
 		// decode into interface
@@ -439,7 +439,7 @@ func TestUnmarshal(t *testing.T) {
 		"integer into interface": {
 			encoded:    []byte("3"),
 			decodeInto: new(interface{}),
-			decoded:    float64(3),
+			decoded:    int64(3),
 		},
 		"empty vs empty string into interface": {
 			encoded:    []byte("a: \"\"\nb: \n"),
@@ -491,7 +491,7 @@ func TestUnmarshal(t *testing.T) {
 		"decode duplicate (non-casematched) into nested struct 2": {
 			encoded:    []byte("A:\n  a: 1\n  b: 1\n  c: test\na:\n  a: 2"),
 			decodeInto: new(UnmarshalNestedStruct),
-			decoded:    UnmarshalNestedStruct{A: UnmarshalStruct{A: "2", B: strPtr("1"), C: "test"}},
+			decoded:    UnmarshalNestedStruct{A: UnmarshalStruct{A: "2", B: strPtr("1")}},
 		},
 		"decode duplicate (non-casematched) into nested slice 1": {
 			encoded:    []byte("a:\n  - a: abc\n    b: def\nA:\n  - a: 123"),
@@ -501,17 +501,17 @@ func TestUnmarshal(t *testing.T) {
 		"decode duplicate (non-casematched) into nested slice 2": {
 			encoded:    []byte("A:\n  - a: abc\n    b: def\na:\n  - a: 123"),
 			decodeInto: new(UnmarshalSlice),
-			decoded:    UnmarshalSlice{[]UnmarshalStruct{{A: "123", B: strPtr("def")}}},
+			decoded:    UnmarshalSlice{[]UnmarshalStruct{{A: "123"}}},
 		},
 		"decode duplicate (non-casematched) into nested string map 1": {
 			encoded:    []byte("a:\n  b: 1\nA:\n  c: 1"),
 			decodeInto: new(UnmarshalStringMap),
-			decoded:    UnmarshalStringMap{map[string]string{"b": "1", "c": "1"}},
+			decoded:    UnmarshalStringMap{map[string]string{"b": "1"}},
 		},
 		"decode duplicate (non-casematched) into nested string map 2": {
 			encoded:    []byte("A:\n  b: 1\na:\n  c: 1"),
 			decodeInto: new(UnmarshalStringMap),
-			decoded:    UnmarshalStringMap{map[string]string{"b": "1", "c": "1"}},
+			decoded:    UnmarshalStringMap{map[string]string{"c": "1"}},
 		},
 		"decode duplicate (non-casematched) into string map": {
 			encoded:    []byte("a: test\nb: test\nA: test2"),
@@ -555,7 +555,7 @@ func TestUnmarshal(t *testing.T) {
 			},
 		},
 
-		// BUG: type info gets lost (#58)
+		// BUG: type info gets lost (#58) - FIXED
 		"decode embeded struct and cast integer to string": {
 			encoded:    []byte("a: 11\nb: testB"),
 			decodeInto: new(UnmarshalEmbedStruct),
@@ -565,7 +565,6 @@ func TestUnmarshal(t *testing.T) {
 				},
 				B: "testB",
 			},
-			err: fatalErrorsType,
 		},
 		"decode embeded structpointer and cast integer to string": {
 			encoded:    []byte("a: 11\nb: testB"),
@@ -576,7 +575,6 @@ func TestUnmarshal(t *testing.T) {
 				},
 				B: "testB",
 			},
-			err: fatalErrorsType,
 		},
 
 		// decoding into incompatible type

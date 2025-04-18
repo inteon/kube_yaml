@@ -20,9 +20,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"reflect"
 	"strconv"
+
+	kubejson "sigs.k8s.io/json"
 
 	yamlv2 "sigs.k8s.io/yaml/goyaml.v2"
 	yamlv3 "sigs.k8s.io/yaml/goyaml.v3"
@@ -80,28 +81,32 @@ type JSONOpt func(*json.Decoder) *json.Decoder
 //
 // Important notes about the Unmarshal logic:
 //
-//   - Decoding is case-insensitive, unlike the rest of Kubernetes API machinery, as this is using the stdlib json library. This might be confusing to users.
-//   - This decodes any number (although it is an integer) into a float64 if the type of obj is unknown, e.g. *map[string]interface{}, *interface{}, or *[]interface{}. This means integers above +/- 2^53 will lose precision when round-tripping. Make a JSONOpt that calls d.UseNumber() to avoid this.
-//   - Duplicate fields, including in-case-sensitive matches, are ignored in an undefined order. Note that the YAML specification forbids duplicate fields, so this logic is more permissive than it needs to. See UnmarshalStrict for an alternative.
-//   - Unknown fields, i.e. serialized data that do not map to a field in obj, are ignored. Use d.DisallowUnknownFields() or UnmarshalStrict to override.
-//   - As per the YAML 1.1 specification, which yaml.v2 used underneath implements, literal 'yes' and 'no' strings without quotation marks will be converted to true/false implicitly.
+//   - Decoding is case-sensitive, just like the rest of the Kubernetes API machinery decoder logic, but unlike the standard library JSON encoder.
+//   - Duplicate fields (only case-sensitive matches) in objects result in a fatal error, as defined in the YAML spec.
+//   - The sequence indentation style is wide, which means that the "- " marker for a YAML sequence will NOT be on the same indentation level as the sequence field name, but two spaces more indented.
+//   - Unknown fields, i.e. serialized data that do not map to a field in obj, are ignored. Use UnmarshalStrict to override.
 //   - YAML non-string keys, e.g. ints, bools and floats, are converted to strings implicitly during the YAML to JSON conversion process.
 //   - There are no compatibility guarantees for returned error values.
-func Unmarshal(yamlBytes []byte, obj interface{}, opts ...JSONOpt) error {
-	return unmarshal(yamlBytes, obj, yamlv3Unmarshal, opts...)
+func Unmarshal(yamlBytes []byte, obj interface{}, deprOpts ...JSONOpt) error {
+	if len(deprOpts) > 0 {
+		return fmt.Errorf("Unmarshal: variadic JSONOpt is deprecated, use UnmarshalStrict instead")
+	}
+	return unmarshal(yamlBytes, obj, yamlv3Unmarshal)
 }
 
 // UnmarshalStrict is similar to Unmarshal (please read its documentation for reference), with the following exceptions:
 //
-//   - Duplicate fields in an object yield an error. This is according to the YAML specification.
-//   - If obj, or any of its recursive children, is a struct, presence of fields in the serialized data unknown to the struct will yield an error.
-func UnmarshalStrict(yamlBytes []byte, obj interface{}, opts ...JSONOpt) error {
-	return unmarshal(yamlBytes, obj, yamlv3UnmarshalStrict, append(opts, DisallowUnknownFields)...)
+//   - If obj, or any of its recursive children, is a struct, presence of fields in the serialized data unknown to the struct will yield a strict error.
+func UnmarshalStrict(yamlBytes []byte, obj interface{}, deprOpts ...JSONOpt) error {
+	if len(deprOpts) > 0 {
+		return fmt.Errorf("Unmarshal: variadic JSONOpt is deprecated")
+	}
+	return unmarshal(yamlBytes, obj, yamlv3UnmarshalStrict, kubejson.DisallowUnknownFields)
 }
 
 // unmarshal unmarshals the given YAML byte stream into the given interface,
 // optionally performing the unmarshalling strictly
-func unmarshal(yamlBytes []byte, obj interface{}, unmarshalFn func([]byte, interface{}) error, opts ...JSONOpt) error {
+func unmarshal(yamlBytes []byte, obj interface{}, unmarshalFn func([]byte, interface{}) error, strictOptions ...kubejson.StrictOption) error {
 	jsonTarget := reflect.ValueOf(obj)
 
 	jsonBytes, err := yamlToJSONTarget(yamlBytes, &jsonTarget, unmarshalFn)
@@ -109,7 +114,7 @@ func unmarshal(yamlBytes []byte, obj interface{}, unmarshalFn func([]byte, inter
 		return fmt.Errorf("error converting YAML to JSON: %w", err)
 	}
 
-	err = jsonUnmarshal(bytes.NewReader(jsonBytes), obj, opts...)
+	err = jsonUnmarshal(jsonBytes, &obj, strictOptions...)
 	if err != nil {
 		return fmt.Errorf("error unmarshaling JSON: %w", err)
 	}
@@ -117,36 +122,32 @@ func unmarshal(yamlBytes []byte, obj interface{}, unmarshalFn func([]byte, inter
 	return nil
 }
 
-// jsonUnmarshal unmarshals the JSON byte stream from the given reader into the
-// object, optionally applying decoder options prior to decoding.  We are not
-// using json.Unmarshal directly as we want the chance to pass in non-default
-// options.
-func jsonUnmarshal(reader io.Reader, obj interface{}, opts ...JSONOpt) error {
-	d := json.NewDecoder(reader)
-	for _, opt := range opts {
-		d = opt(d)
+func jsonUnmarshal(jsonBytes []byte, obj interface{}, strictOptions ...kubejson.StrictOption) error {
+	if len(strictOptions) == 0 {
+		if err := kubejson.UnmarshalCaseSensitivePreserveInts(jsonBytes, obj); err != nil {
+			return fmt.Errorf("while decoding JSON: %w", err)
+		}
+		return nil
 	}
-	if err := d.Decode(&obj); err != nil {
+
+	strictErrors, err := kubejson.UnmarshalStrict(jsonBytes, obj, strictOptions...)
+	if err != nil {
 		return fmt.Errorf("while decoding JSON: %w", err)
+	}
+	if len(strictErrors) > 0 {
+		return fmt.Errorf("while decoding JSON: json: %w", strictErrors[0])
 	}
 	return nil
 }
 
 // JSONToYAML converts JSON to YAML. Notable implementation details:
 //
-//   - Duplicate fields, are case-sensitively ignored in an undefined order.
-//   - The sequence indentation style is compact, which means that the "- " marker for a YAML sequence will be on the same indentation level as the sequence field name.
-//   - Unlike Unmarshal, all integers, up to 64 bits, are preserved during this round-trip.
+//   - Duplicate fields (only case-sensitive matches) in objects result in a fatal error, as defined in the YAML spec.
 func JSONToYAML(j []byte) ([]byte, error) {
 	// Convert the JSON to an object.
 	var jsonObj interface{}
 
-	// We are using yaml.Unmarshal here (instead of json.Unmarshal) because the
-	// Go JSON library doesn't try to pick the right number type (int, float,
-	// etc.) when unmarshalling to interface{}, it just picks float64
-	// universally. go-yaml does go through the effort of picking the right
-	// number type, so we can preserve number type throughout this process.
-	err := yamlv3Unmarshal(j, &jsonObj)
+	err := jsonUnmarshal(j, &jsonObj)
 	if err != nil {
 		return nil, err
 	}
@@ -174,9 +175,7 @@ func JSONToYAML(j []byte) ([]byte, error) {
 //
 // Notable about the implementation:
 //
-// - Duplicate fields are case-sensitively ignored in an undefined order. Note that the YAML specification forbids duplicate fields, so this logic is more permissive than it needs to. See YAMLToJSONStrict for an alternative.
-// - As per the YAML 1.1 specification, which yaml.v2 used underneath implements, literal 'yes' and 'no' strings without quotation marks will be converted to true/false implicitly.
-// - Unlike Unmarshal, all integers, up to 64 bits, are preserved during this round-trip.
+// - Duplicate fields (only case-sensitive matches) in objects result in a fatal error, as defined in the YAML spec.
 // - There are no compatibility guarantees for returned error values.
 func YAMLToJSON(y []byte) ([]byte, error) {
 	return yamlToJSONTarget(y, nil, yamlv3Unmarshal)
@@ -312,10 +311,21 @@ func convertToJSONableObject(yamlObj interface{}, jsonTarget *reflect.Value) (in
 							break
 						}
 					}
+
 					if f != nil {
 						// Find the reflect.Value of the most preferential
 						// struct field.
-						jtf := t.Field(f.index[0])
+						jtf := t
+						for _, i := range f.index {
+							if jtf.Kind() == reflect.Ptr {
+								if jtf.IsNil() {
+									jtf = reflect.New(jtf.Type().Elem())
+								}
+								jtf = jtf.Elem()
+							}
+							jtf = jtf.Field(i)
+						}
+
 						strMap[keyString], err = convertToJSONableObject(v, &jtf)
 						if err != nil {
 							return nil, err
